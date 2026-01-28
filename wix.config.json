@@ -1,0 +1,5 @@
+{
+  "$schema": "https://dev.wix.com/wix-cli/schemas/wix-config.json",
+  "appId": "56d969fd-3013-43ba-b5e0-a70d0051f235",
+  "projectId": "products-additonal-fees"
+}
