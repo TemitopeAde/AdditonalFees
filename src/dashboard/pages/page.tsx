@@ -154,18 +154,45 @@ const Index: FC = () => {
     });
   };
 
+  // Get label for a fee option from FEE_CATEGORIES
+  const getFeeOptionLabel = (optionId: string): string => {
+    for (const category of FEE_CATEGORIES) {
+      const option = category.options.find(o => o.id === optionId);
+      if (option) return option.label;
+    }
+    return optionId; // Fallback to optionId if not found
+  };
+
   const handleSave = async () => {
     if ((activeTab === 'PRODUCT' || activeTab === 'CATEGORY') && !selectedId) {
       dashboard.showToast({ message: `Please select a ${activeTab.toLowerCase()} first`, type: 'error' });
       return;
     }
 
+    // Validate that enabled fees have a value greater than 0
+    const enabledFees = feesConfig.filter(f => f.enabled);
+    const invalidFees = enabledFees.filter(f => !f.value || f.value <= 0);
+
+    if (invalidFees.length > 0) {
+      dashboard.showToast({
+        message: 'All enabled fees must have a value greater than 0',
+        type: 'error'
+      });
+      return;
+    }
+
+    // Add label to each fee before saving
+    const feesWithLabels = enabledFees.map(fee => ({
+      ...fee,
+      label: fee.label || getFeeOptionLabel(fee.optionId)
+    }));
+
     setSaving(true);
     try {
       await saveFeesConfig({
         targetType: activeTab as any,
         targetId: selectedId || undefined,
-        fees: feesConfig.filter(f => f.enabled)
+        fees: feesWithLabels
       });
       dashboard.showToast({ message: 'Configuration saved successfully!' });
       if (activeTab === 'GLOBAL') {
@@ -179,18 +206,18 @@ const Index: FC = () => {
     }
   };
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (targetType: 'PRODUCT' | 'CATEGORY' | 'GLOBAL', targetId?: string) => {
     if (!window.confirm('Are you sure you want to delete this configuration?')) return;
 
     setDeleting(true);
     try {
-      console.log('Attempting to delete config with id:', id);
-      await deleteFeesConfig(id);
+      console.log('Attempting to delete config:', targetType, targetId);
+      await deleteFeesConfig(targetType, targetId);
       dashboard.showToast({ message: 'Configuration deleted successfully!' });
       if (activeTab === 'OVERVIEW') {
         await loadAllConfigs();
       } else {
-        if (activeTab === 'GLOBAL') {
+        if (targetType === 'GLOBAL') {
           setHasGlobalConfig(false);
         }
         setFeesConfig([]);
@@ -207,6 +234,53 @@ const Index: FC = () => {
 
   const getFeeState = (optionId: string) => {
     return feesConfig.find(f => f.optionId === optionId) || { enabled: false, type: 'FIXED', value: 0 };
+  };
+
+  // Check if all options in a category are enabled
+  const isCategoryAllChecked = (categoryOptions: { id: string }[]) => {
+    return categoryOptions.every(option => getFeeState(option.id).enabled);
+  };
+
+  // Check if some (but not all) options in a category are enabled
+  const isCategorySomeChecked = (categoryOptions: { id: string }[]) => {
+    const checkedCount = categoryOptions.filter(option => getFeeState(option.id).enabled).length;
+    return checkedCount > 0 && checkedCount < categoryOptions.length;
+  };
+
+  // Toggle all options in a category
+  const toggleCategoryFees = (categoryOptions: { id: string }[], enabled: boolean) => {
+    setFeesConfig(prev => {
+      let updated = [...prev];
+      categoryOptions.forEach(option => {
+        const existing = updated.find(f => f.optionId === option.id);
+        if (existing) {
+          updated = updated.map(f => f.optionId === option.id ? { ...f, enabled } : f);
+        } else {
+          updated.push({ optionId: option.id, enabled, type: 'FIXED', value: 0 });
+        }
+      });
+      return updated;
+    });
+  };
+
+  // Check if all custom fees are enabled
+  const isCustomFeesAllChecked = () => {
+    const customFees = feesConfig.filter(f => f.optionId.startsWith('custom_'));
+    return customFees.length > 0 && customFees.every(f => f.enabled);
+  };
+
+  // Check if some custom fees are enabled
+  const isCustomFeesSomeChecked = () => {
+    const customFees = feesConfig.filter(f => f.optionId.startsWith('custom_'));
+    const checkedCount = customFees.filter(f => f.enabled).length;
+    return checkedCount > 0 && checkedCount < customFees.length;
+  };
+
+  // Toggle all custom fees
+  const toggleAllCustomFees = (enabled: boolean) => {
+    setFeesConfig(prev => prev.map(f =>
+      f.optionId.startsWith('custom_') ? { ...f, enabled } : f
+    ));
   };
 
   const getTargetName = (item: any) => {
@@ -314,7 +388,7 @@ const Index: FC = () => {
                                 ) : (
                                   <IconButton
                                     skin="light"
-                                    onClick={() => handleDelete(row._id)}
+                                    onClick={() => handleDelete(row.targetType, row.targetId)}
                                   >
                                     <Icons.Delete />
                                   </IconButton>
@@ -386,7 +460,21 @@ const Index: FC = () => {
                             multiple
                             items={[
                               ...FEE_CATEGORIES.map(category => ({
-                                title: category.title,
+                                title: (
+                                  <Box gap="12px" verticalAlign="middle">
+                                    <div onClick={(e) => e.stopPropagation()}>
+                                      <Checkbox
+                                        checked={isCategoryAllChecked(category.options)}
+                                        indeterminate={isCategorySomeChecked(category.options)}
+                                        onChange={(e) => {
+                                          e.stopPropagation();
+                                          toggleCategoryFees(category.options, e.target.checked);
+                                        }}
+                                      />
+                                    </div>
+                                    <Text weight="bold">{category.title}</Text>
+                                  </Box>
+                                ),
                                 initiallyOpen: true,
                                 children: (
                                   <Box padding="20px" direction="vertical" gap="24px">
@@ -421,7 +509,14 @@ const Index: FC = () => {
                                               >
                                                 <NumberInput
                                                   value={state.value}
-                                                  onChange={val => updateFeeConfig(option.id, { value: val || 0 })}
+                                                  min={0}
+                                                  onChange={val => {
+                                                    const newVal = typeof val === 'number' ? Math.max(0, val) : 0;
+                                                    updateFeeConfig(option.id, { value: newVal });
+                                                  }}
+                                                  onBlur={() => {
+                                                    if (state.value < 0) updateFeeConfig(option.id, { value: 0 });
+                                                  }}
                                                   prefix={state.type === 'PERCENTAGE' ? undefined : <Box verticalAlign="middle" display="inline-flex" align="center" paddingRight="4px">$</Box>}
                                                   suffix={state.type === 'PERCENTAGE' ? <Box verticalAlign="middle" display="inline-flex" align="center" paddingLeft="4px">%</Box> : undefined}
                                                 />
@@ -435,7 +530,22 @@ const Index: FC = () => {
                                 )
                               })),
                               {
-                                title: '✏️ Custom Additional Fees',
+                                title: (
+                                  <Box gap="12px" verticalAlign="middle">
+                                    <div onClick={(e) => e.stopPropagation()}>
+                                      <Checkbox
+                                        checked={feesConfig.filter(f => f.optionId.startsWith('custom_')).length > 0 && isCustomFeesAllChecked()}
+                                        indeterminate={feesConfig.filter(f => f.optionId.startsWith('custom_')).length > 0 && isCustomFeesSomeChecked()}
+                                        onChange={(e) => {
+                                          e.stopPropagation();
+                                          toggleAllCustomFees(e.target.checked);
+                                        }}
+                                        disabled={feesConfig.filter(f => f.optionId.startsWith('custom_')).length === 0}
+                                      />
+                                    </div>
+                                    <Text weight="bold">✏️ Custom Additional Fees</Text>
+                                  </Box>
+                                ),
                                 initiallyOpen: true,
                                 children: (
                                   <Box padding="20px" direction="vertical" gap="24px">
@@ -477,7 +587,14 @@ const Index: FC = () => {
                                           <FormField label={fee.type === 'PERCENTAGE' ? 'Percentage (%)' : 'Amount'}>
                                             <NumberInput
                                               value={fee.value}
-                                              onChange={val => updateFeeConfig(fee.optionId, { value: val || 0 })}
+                                              min={0}
+                                              onChange={val => {
+                                                const newVal = typeof val === 'number' ? Math.max(0, val) : 0;
+                                                updateFeeConfig(fee.optionId, { value: newVal });
+                                              }}
+                                              onBlur={() => {
+                                                if (fee.value < 0) updateFeeConfig(fee.optionId, { value: 0 });
+                                              }}
                                               prefix={fee.type === 'PERCENTAGE' ? undefined : <Box verticalAlign="middle" display="inline-flex" align="center" paddingRight="4px">$</Box>}
                                               suffix={fee.type === 'PERCENTAGE' ? <Box verticalAlign="middle" display="inline-flex" align="center" paddingLeft="4px">%</Box> : undefined}
                                             />
@@ -499,7 +616,7 @@ const Index: FC = () => {
                             {currentConfigId && (
                               <Button
                                 skin="destructive"
-                                onClick={() => handleDelete(currentConfigId)}
+                                onClick={() => handleDelete(activeTab as 'PRODUCT' | 'CATEGORY' | 'GLOBAL', selectedId || undefined)}
                                 disabled={deleting || saving}
                                 prefixIcon={deleting ? <Box verticalAlign="middle" display="inline-flex"><Loader size="tiny" /></Box> : <Icons.Delete />}
                               >

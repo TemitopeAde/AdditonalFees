@@ -867,28 +867,105 @@ export const getProductsByCollection = webMethod(
   }
 );
 
+// Helper function to get products for saving fees
+const getProductsForFeeConfig = async (targetType: 'PRODUCT' | 'CATEGORY' | 'GLOBAL', targetId?: string): Promise<{ _id: string; name: string }[]> => {
+  const elevatedGetCatalogVersion = auth.elevate(catalogVersioning.getCatalogVersion);
+  const catalogVersionResponse = await elevatedGetCatalogVersion();
+
+  if (targetType === 'PRODUCT' && targetId) {
+    return [{ _id: targetId, name: '' }];
+  }
+
+  const isV3 = catalogVersionResponse.catalogVersion === 'V3_CATALOG';
+
+  if (isV3) {
+    try {
+      const elevatedQueryProducts = auth.elevate(productsV3.queryProducts);
+      const allItems: any[] = [];
+      let queryBuilder = (elevatedQueryProducts as any)({
+        fields: ['ALL_CATEGORIES_INFO']
+      }).limit(100);
+      let hasMorePages = true;
+
+      while (hasMorePages) {
+        const resultsV3 = await queryBuilder.find();
+
+        if (targetType === 'CATEGORY' && targetId) {
+          // Filter by category
+          const filtered = resultsV3.items.filter((product: any) =>
+            product.allCategoriesInfo?.categories?.some((cat: any) => cat._id === targetId)
+          );
+          allItems.push(...filtered);
+        } else {
+          // GLOBAL - get all
+          allItems.push(...resultsV3.items);
+        }
+
+        if (resultsV3.cursors?.next) {
+          queryBuilder = queryBuilder.skipTo(resultsV3.cursors.next);
+        } else {
+          hasMorePages = false;
+        }
+      }
+
+      return allItems.map((p: any) => ({
+        _id: typeof p._id === 'object' ? p._id.value || p._id._id : p._id,
+        name: typeof p.name === 'object' ? p.name.value || p.name.name : p.name
+      }));
+    } catch (v3Error) {
+      console.warn('V3 query failed in getProductsForFeeConfig, falling back to V1:', v3Error);
+    }
+  }
+
+  // V1 fallback
+  const elevatedQueryProducts = auth.elevate(products.queryProducts);
+  let allProducts: any[] = [];
+  let resultsV1 = await elevatedQueryProducts().limit(100).find();
+  allProducts = allProducts.concat(resultsV1.items);
+
+  while (resultsV1.hasNext()) {
+    resultsV1 = await resultsV1.next();
+    allProducts = allProducts.concat(resultsV1.items);
+  }
+
+  // Filter by category if needed
+  if (targetType === 'CATEGORY' && targetId) {
+    allProducts = allProducts.filter((p: any) => p.collectionIds?.includes(targetId));
+  }
+
+  return allProducts.map((p: any) => ({ _id: p._id, name: p.name }));
+};
+
 export const saveFeesConfig = webMethod(
   Permissions.Anyone,
   async (config: { targetType: 'PRODUCT' | 'CATEGORY' | 'GLOBAL', targetId?: string, fees: any[] }) => {
     try {
-      // Find existing item by targetType and targetId
-      let query = items.query(CONFIG_COLLECTION_NAME).eq("targetType", config.targetType);
-      if (config.targetId) {
-        query = query.eq("targetId", config.targetId);
+      // Get the products to save fees for
+      const productsToSave = await getProductsForFeeConfig(config.targetType, config.targetId);
+      const now = new Date().toISOString();
+      const feesJson = JSON.stringify(config.fees);
+
+      // Save a record for each product
+      for (const product of productsToSave) {
+        // Check if a record already exists for this product
+        const existingQuery = items.query(CONFIG_COLLECTION_NAME).eq("productId", product._id);
+        const { items: existingItems } = await existingQuery.find();
+        const existingItem = existingItems && existingItems.length > 0 ? existingItems[0] : null;
+
+        const dataToSave: any = {
+          _id: existingItem?._id,
+          targetType: config.targetType,
+          targetId: config.targetId || 'GLOBAL',
+          productId: product._id,
+          fees: feesJson,
+          updatedDate: now,
+          ...(existingItem ? {} : { createdDate: now })
+        };
+
+        await items.save(CONFIG_COLLECTION_NAME, dataToSave);
       }
 
-      const { items: existingItems } = await query.find();
-
-      const existingItem = existingItems && existingItems.length > 0 ? existingItems[0] : null;
-      await items.save(CONFIG_COLLECTION_NAME, {
-        _id: existingItem?._id,
-        targetType: config.targetType,
-        targetId: config.targetId || 'GLOBAL',
-        fees: JSON.stringify(config.fees),
-        updatedDate: new Date().toISOString(),
-        ...(existingItem ? {} : { createdDate: new Date().toISOString() })
-      })
-      return { success: true };
+      return { success: true, productsUpdated: productsToSave.length };
     } catch (error) {
       console.error('Error saving fees config:', error);
       throw new Error('Failed to save fees config');
@@ -911,11 +988,40 @@ export const getFeesConfig = webMethod(
 
       const { items: resultItems } = await query.find();
 
-      return (resultItems || []).map((item: any) => ({
-        _id: item._id,
-        ...item,
-        fees: item.fees ? JSON.parse(item.fees as string) : []
-      }));
+      if (!resultItems || resultItems.length === 0) {
+        return [];
+      }
+
+      // If querying for a specific targetType and targetId, return the first match (all products have same fees)
+      if (targetType && targetId) {
+        const item = resultItems[0];
+        return [{
+          _id: item._id,
+          targetType: item.targetType,
+          targetId: item.targetId,
+          fees: item.fees ? JSON.parse(item.fees as string) : [],
+          productCount: resultItems.length
+        }];
+      }
+
+      // For overview (no filters or just targetType), group by targetType+targetId
+      const grouped = new Map<string, any>();
+      for (const item of resultItems) {
+        const key = `${item.targetType}:${item.targetId}`;
+        if (!grouped.has(key)) {
+          grouped.set(key, {
+            _id: item._id,
+            targetType: item.targetType,
+            targetId: item.targetId,
+            fees: item.fees ? JSON.parse(item.fees as string) : [],
+            productCount: 1
+          });
+        } else {
+          grouped.get(key).productCount++;
+        }
+      }
+
+      return Array.from(grouped.values());
     } catch (error) {
       console.error('Error fetching fees config:', error);
       return [];
@@ -925,14 +1031,60 @@ export const getFeesConfig = webMethod(
 
 export const deleteFeesConfig = webMethod(
   Permissions.Anyone,
-  async (id: string) => {
+  async (targetType: 'PRODUCT' | 'CATEGORY' | 'GLOBAL', targetId?: string) => {
     try {
+      // Find all records with the given targetType and targetId
+      let deleteQuery = items.query(CONFIG_COLLECTION_NAME).eq("targetType", targetType);
+      if (targetId) {
+        deleteQuery = deleteQuery.eq("targetId", targetId);
+      } else if (targetType === 'GLOBAL') {
+        deleteQuery = deleteQuery.eq("targetId", "GLOBAL");
+      }
+
+      const { items: itemsToDelete } = await deleteQuery.find();
+
+      if (!itemsToDelete || itemsToDelete.length === 0) {
+        throw new Error('Configuration not found');
+      }
+
       const elevatedRemove = auth.elevate(items.remove);
-      await elevatedRemove(CONFIG_COLLECTION_NAME, id);
-      return { success: true };
+
+      for (const item of itemsToDelete) {
+        await elevatedRemove(CONFIG_COLLECTION_NAME, item._id);
+      }
+
+      return { success: true, deletedCount: itemsToDelete.length };
     } catch (error) {
       console.error('Error deleting fees config:', error);
       throw new Error(`Failed to delete fees config: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+);
+
+// Get fees config by product ID - useful for other apps to query
+export const getFeesConfigByProductId = webMethod(
+  Permissions.Anyone,
+  async (productId: string) => {
+    try {
+      const query = items.query(CONFIG_COLLECTION_NAME).eq("productId", productId);
+      const { items: resultItems } = await query.find();
+
+      if (resultItems && resultItems.length > 0) {
+        const item = resultItems[0];
+        return {
+          _id: item._id,
+          productId: item.productId,
+          targetType: item.targetType,
+          fees: item.fees ? JSON.parse(item.fees as string) : [],
+          updatedDate: item.updatedDate,
+          createdDate: item.createdDate
+        };
+      }
+
+      return null;
+    } catch (error) {
+      console.error('Error fetching fees config by product ID:', error);
+      return null;
     }
   }
 );
