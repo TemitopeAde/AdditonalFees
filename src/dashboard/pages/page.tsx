@@ -358,11 +358,13 @@ const Index: FC = () => {
             <Layout>
             {showFreeTrialButton && (
               <Cell span={12}>
-                <Box align="right">
-                  <Button onClick={openFreeTrial} disabled={openingTrial} skin="premium">
-                    {openingTrial ? 'Opening Free Trial...' : 'Start Free Trial'}
-                  </Button>
-                </Box>
+                <SectionHelper
+                  skin="warning"
+                  actionText={openingTrial ? 'Opening Free Trial...' : 'Start Free Trial'}
+                  onAction={openingTrial ? undefined : openFreeTrial}
+                >
+                  Additional prices will not be applied in cart or checkout until you start a free trial or upgrade.
+                </SectionHelper>
               </Cell>
             )}
             <Cell span={12}>
