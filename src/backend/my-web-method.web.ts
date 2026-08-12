@@ -11,7 +11,7 @@ import { items } from '@wix/data';
 
 // DEV MODE FLAG - Set to true to unlock all premium features for testing
 // Set this back to false when done testing
-const DEV_MODE = true;
+const DEV_MODE = false;
 const CONFIG_COLLECTION_NAME = '@hi-konsult/products-additonal-fees/ProductsSetup';
 
 const stripRichContent = (content: any): string => {
@@ -502,7 +502,8 @@ export const isPremiumUser = webMethod(
       const freeTrialAvailable = !!response?.instance?.freeTrialAvailable;
 
       // Check if there's an active trial by checking the status
-      const billing = response?.instance?.billing;
+      const billing: any = response?.instance?.billing;
+      const planName = billing?.planName || (response?.instance as any)?.planName || null;
       const trialStatus = billing?.freeTrialInfo?.status;
       const trialEndDate = billing?.freeTrialInfo?.endDate;
 
@@ -520,6 +521,7 @@ export const isPremiumUser = webMethod(
         isFree: DEV_MODE ? false : isFree, // Report as not free in dev mode to bypass frontend checks
         hasActiveTrial,
         freeTrialAvailable,
+        planName,
         trialStatus: trialStatus || null,
         trialEndDate: trialEndDate || null,
         instance: response?.instance,
@@ -533,6 +535,7 @@ export const isPremiumUser = webMethod(
         isFree: DEV_MODE ? false : true,
         hasActiveTrial: false,
         freeTrialAvailable: false,
+        planName: null,
         trialStatus: null,
         trialEndDate: null,
         instance: null,
@@ -940,19 +943,28 @@ export const saveFeesConfig = webMethod(
   Permissions.Anyone,
   async (config: { targetType: 'PRODUCT' | 'CATEGORY' | 'GLOBAL', targetId?: string, fees: any[] }) => {
     try {
+      // Dashboard users do not necessarily have CMS write permissions. The
+      // web method is the trusted server boundary, so use elevated Data API
+      // calls for the app-owned collection.
+      const elevatedQuery = auth.elevate(items.query);
+      const elevatedBulkSave = auth.elevate(items.bulkSave);
+
       // Get the products to save fees for
       const productsToSave = await getProductsForFeeConfig(config.targetType, config.targetId);
       const now = new Date().toISOString();
       const feesJson = JSON.stringify(config.fees);
 
-      // Save a record for each product
-      for (const product of productsToSave) {
-        // Check if a record already exists for this product
-        const existingQuery = items.query(CONFIG_COLLECTION_NAME).eq("productId", product._id);
-        const { items: existingItems } = await existingQuery.find();
-        const existingItem = existingItems && existingItems.length > 0 ? existingItems[0] : null;
-
-        const dataToSave: any = {
+      // Resolve existing IDs in one query, then write in bulk. The old
+      // sequential query/save loop could time out on a production store with
+      // many products even though the earlier writes had already succeeded.
+      const productIds = productsToSave.map(product => product._id);
+      const existingItems = productIds.length > 0
+        ? (await elevatedQuery(CONFIG_COLLECTION_NAME).hasSome("productId", productIds).find()).items
+        : [];
+      const existingByProductId = new Map(existingItems.map((item: any) => [item.productId, item]));
+      const dataToSave = productsToSave.map(product => {
+        const existingItem = existingByProductId.get(product._id) as any;
+        return {
           _id: existingItem?._id,
           targetType: config.targetType,
           targetId: config.targetId || 'GLOBAL',
@@ -961,14 +973,22 @@ export const saveFeesConfig = webMethod(
           updatedDate: now,
           ...(existingItem ? {} : { createdDate: now })
         };
+      });
 
-        await items.save(CONFIG_COLLECTION_NAME, dataToSave);
+      // Keep batches comfortably below the Data API bulk request limit.
+      for (let index = 0; index < dataToSave.length; index += 100) {
+        await elevatedBulkSave(CONFIG_COLLECTION_NAME, dataToSave.slice(index, index + 100));
       }
 
       return { success: true, productsUpdated: productsToSave.length };
     } catch (error) {
-      console.error('Error saving fees config:', error);
-      throw new Error('Failed to save fees config');
+      console.error('Error saving fees config:', {
+        collection: CONFIG_COLLECTION_NAME,
+        targetType: config.targetType,
+        targetId: config.targetId,
+        error
+      });
+      throw new Error(`Failed to save fees config: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 );
@@ -977,7 +997,8 @@ export const getFeesConfig = webMethod(
   Permissions.Anyone,
   async (targetType?: 'PRODUCT' | 'CATEGORY' | 'GLOBAL', targetId?: string) => {
     try {
-      let query = items.query(CONFIG_COLLECTION_NAME);
+      const elevatedQuery = auth.elevate(items.query);
+      let query = elevatedQuery(CONFIG_COLLECTION_NAME);
 
       if (targetType) {
         query = query.eq("targetType", targetType);
@@ -1033,8 +1054,10 @@ export const deleteFeesConfig = webMethod(
   Permissions.Anyone,
   async (targetType: 'PRODUCT' | 'CATEGORY' | 'GLOBAL', targetId?: string) => {
     try {
+      const elevatedQuery = auth.elevate(items.query);
+      const elevatedBulkRemove = auth.elevate(items.bulkRemove);
       // Find all records with the given targetType and targetId
-      let deleteQuery = items.query(CONFIG_COLLECTION_NAME).eq("targetType", targetType);
+      let deleteQuery = elevatedQuery(CONFIG_COLLECTION_NAME).eq("targetType", targetType);
       if (targetId) {
         deleteQuery = deleteQuery.eq("targetId", targetId);
       } else if (targetType === 'GLOBAL') {
@@ -1047,10 +1070,11 @@ export const deleteFeesConfig = webMethod(
         throw new Error('Configuration not found');
       }
 
-      const elevatedRemove = auth.elevate(items.remove);
-
-      for (const item of itemsToDelete) {
-        await elevatedRemove(CONFIG_COLLECTION_NAME, item._id);
+      // Delete in bulk so a global rule with many product records does not
+      // time out after the records have already been removed.
+      const itemIds = itemsToDelete.map((item: any) => item._id);
+      for (let index = 0; index < itemIds.length; index += 100) {
+        await elevatedBulkRemove(CONFIG_COLLECTION_NAME, itemIds.slice(index, index + 100));
       }
 
       return { success: true, deletedCount: itemsToDelete.length };
@@ -1066,7 +1090,8 @@ export const getFeesConfigByProductId = webMethod(
   Permissions.Anyone,
   async (productId: string) => {
     try {
-      const query = items.query(CONFIG_COLLECTION_NAME).eq("productId", productId);
+      const elevatedQuery = auth.elevate(items.query);
+      const query = elevatedQuery(CONFIG_COLLECTION_NAME).eq("productId", productId);
       const { items: resultItems } = await query.find();
 
       if (resultItems && resultItems.length > 0) {
