@@ -502,7 +502,8 @@ export const isPremiumUser = webMethod(
       const freeTrialAvailable = !!response?.instance?.freeTrialAvailable;
 
       // Check if there's an active trial by checking the status
-      const billing = response?.instance?.billing;
+      const billing: any = response?.instance?.billing;
+      const planName = billing?.planName || (response?.instance as any)?.planName || null;
       const trialStatus = billing?.freeTrialInfo?.status;
       const trialEndDate = billing?.freeTrialInfo?.endDate;
 
@@ -520,6 +521,7 @@ export const isPremiumUser = webMethod(
         isFree: DEV_MODE ? false : isFree, // Report as not free in dev mode to bypass frontend checks
         hasActiveTrial,
         freeTrialAvailable,
+        planName,
         trialStatus: trialStatus || null,
         trialEndDate: trialEndDate || null,
         instance: response?.instance,
@@ -533,6 +535,7 @@ export const isPremiumUser = webMethod(
         isFree: DEV_MODE ? false : true,
         hasActiveTrial: false,
         freeTrialAvailable: false,
+        planName: null,
         trialStatus: null,
         trialEndDate: null,
         instance: null,

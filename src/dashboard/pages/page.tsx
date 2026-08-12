@@ -25,7 +25,16 @@ import {
 import '@wix/design-system/styles.global.css';
 import * as Icons from '@wix/wix-ui-icons-common';
 import { FEE_CATEGORIES, FeeConfig } from '../fees-data';
-import { getAllProducts, getAllStoreCategories, saveFeesConfig, getFeesConfig, deleteFeesConfig } from '../../backend/my-web-method.web';
+import {
+  getAllProducts,
+  getAllStoreCategories,
+  saveFeesConfig,
+  getFeesConfig,
+  deleteFeesConfig,
+  isPremiumUser
+} from '../../backend/my-web-method.web';
+
+const APP_ID = '56d969fd-3013-43ba-b5e0-a70d0051f235';
 
 const Index: FC = () => {
   const [products, setProducts] = useState<any[]>([]);
@@ -39,18 +48,54 @@ const Index: FC = () => {
   const [deleting, setDeleting] = useState(false);
   const [currentConfigId, setCurrentConfigId] = useState<string | null>(null);
   const [hasGlobalConfig, setHasGlobalConfig] = useState(false);
+  const [billingStatus, setBillingStatus] = useState<{
+    isFree: boolean;
+    planName: string | null;
+    freeTrialAvailable: boolean;
+    instanceId: string | null;
+  } | null>(null);
+  const [openingTrial, setOpeningTrial] = useState(false);
 
   useEffect(() => {
     loadInitialData();
   }, []);
 
+  // Wix reports an eligible, not-yet-started trial as isFree=true and
+  // freeTrialAvailable=true. An active trial is reported separately in
+  // billing.freeTrialInfo and isFree becomes false.
+  const showFreeTrialButton =
+    billingStatus?.isFree === true && billingStatus.freeTrialAvailable === true;
+
+  const openFreeTrial = async () => {
+    setOpeningTrial(true);
+    try {
+      const instanceId = billingStatus?.instanceId;
+      if (!instanceId) throw new Error('No app instance ID was returned');
+
+      const url = `https://www.wix.com/apps/upgrade/${APP_ID}?appInstanceId=${encodeURIComponent(instanceId)}`;
+      window.open(url, '_blank', 'noopener,noreferrer');
+    } catch (error) {
+      console.error('Failed to open free trial checkout', error);
+      dashboard.showToast({ message: 'Unable to open the free trial checkout', type: 'error' });
+    } finally {
+      setOpeningTrial(false);
+    }
+  };
+
   const loadInitialData = async () => {
     setLoading(true);
     try {
-      const [productsRes, categoriesRes] = await Promise.all([
+      const [productsRes, categoriesRes, billingRes] = await Promise.all([
         getAllProducts(),
-        getAllStoreCategories()
+        getAllStoreCategories(),
+        isPremiumUser()
       ]);
+      setBillingStatus({
+        isFree: !!(billingRes as any)?.isFree,
+        planName: (billingRes as any)?.planName || null,
+        freeTrialAvailable: !!(billingRes as any)?.freeTrialAvailable,
+        instanceId: (billingRes as any)?.instance?.instanceId || null
+      });
       setProducts(productsRes.items || []);
       setCategories(categoriesRes || []);
 
@@ -305,12 +350,21 @@ const Index: FC = () => {
   return (
     <WixDesignSystemProvider features={{ newColorsBranding: true }}>
       <Page>
-        <Page.Header
-          title="Additional Fees Management"
-          subtitle="Configure additional fees by product, category, or globally."
-        />
-        <Page.Content>
-          <Layout>
+          <Page.Header
+            title="Additional Fees Management"
+            subtitle="Configure additional fees by product, category, or globally."
+          />
+          <Page.Content>
+            <Layout>
+            {showFreeTrialButton && (
+              <Cell span={12}>
+                <Box align="right">
+                  <Button onClick={openFreeTrial} disabled={openingTrial} skin="premium">
+                    {openingTrial ? 'Opening Free Trial...' : 'Start Free Trial'}
+                  </Button>
+                </Box>
+              </Cell>
+            )}
             <Cell span={12}>
               <Tabs
                 activeId={activeTab}
